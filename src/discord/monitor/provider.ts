@@ -465,12 +465,12 @@ export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
   const execApprovalsConfig = discordCfg.execApprovals ?? {};
   const execApprovalsHandler = execApprovalsConfig.enabled
     ? new DiscordExecApprovalHandler({
-        token,
-        accountId: account.accountId,
-        config: execApprovalsConfig,
-        cfg,
-        runtime,
-      })
+      token,
+      accountId: account.accountId,
+      config: execApprovalsConfig,
+      cfg,
+      runtime,
+    })
     : null;
 
   const components = [
@@ -511,17 +511,25 @@ export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
     ],
   );
 
-  await deployDiscordCommands({ client, runtime, enabled: nativeEnabled });
+  // Deploy commands in background to avoid blocking message handler startup if stuck in a
+  // retry loop due to daily rate limits.
+  deployDiscordCommands({ client, runtime, enabled: nativeEnabled }).catch((err) => {
+    runtime.error?.(danger(`discord: unexpected error in command deployment: ${String(err)}`));
+  });
 
   const logger = createSubsystemLogger("discord/monitor");
   const guildHistories = new Map<string, HistoryEntry[]>();
   let botUserId: string | undefined;
 
   if (nativeDisabledExplicit) {
-    await clearDiscordNativeCommands({
+    // Clear commands in background to avoid blocking message handler startup if stuck in a
+    // retry loop due to daily rate limits.
+    clearDiscordNativeCommands({
       client,
       applicationId,
       runtime,
+    }).catch((err) => {
+      runtime.error?.(danger(`discord: unexpected error in clearing commands: ${String(err)}`));
     });
   }
 
@@ -603,7 +611,7 @@ export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
     }
     // Carbon emits an error when maxAttempts is 0; keep a one-shot listener to avoid
     // an unhandled error after we tear down listeners during abort.
-    gatewayEmitter?.once("error", () => {});
+    gatewayEmitter?.once("error", () => { });
     gateway.options.reconnect = { maxAttempts: 0 };
     gateway.disconnect();
   };
@@ -641,9 +649,9 @@ export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
     await waitForDiscordGatewayStop({
       gateway: gateway
         ? {
-            emitter: gatewayEmitter,
-            disconnect: () => gateway.disconnect(),
-          }
+          emitter: gatewayEmitter,
+          disconnect: () => gateway.disconnect(),
+        }
         : undefined,
       abortSignal,
       onGatewayError: (err) => {
