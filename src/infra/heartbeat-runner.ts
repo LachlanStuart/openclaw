@@ -53,7 +53,12 @@ import {
   resolveHeartbeatDeliveryTarget,
   resolveHeartbeatSenderContext,
 } from "./outbound/targets.js";
-import { peekSystemEvents } from "./system-events.js";
+import {
+  peekSystemEvents,
+  peekSystemEventsForPrefix,
+  drainSystemEventsForPrefix,
+  enqueueSystemEvent,
+} from "./system-events.js";
 
 type HeartbeatDeps = OutboundSendDeps &
   ChannelHeartbeatDeps & {
@@ -490,14 +495,23 @@ export async function runHeartbeatOnce(opts: {
   const cfg = opts.cfg ?? loadConfig();
   const agentId = normalizeAgentId(opts.agentId ?? resolveDefaultAgentId(cfg));
   const heartbeat = opts.heartbeat ?? resolveHeartbeatConfig(cfg, agentId);
+  const isExecEventReason = opts.reason === "exec-event";
   if (!heartbeatsEnabled) {
-    return { status: "skipped", reason: "disabled" };
+    // Always allow exec-event notifications even when heartbeats are globally disabled.
+    if (!isExecEventReason) {
+      return { status: "skipped", reason: "disabled" };
+    }
   }
   if (!isHeartbeatEnabledForAgent(cfg, agentId)) {
-    return { status: "skipped", reason: "disabled" };
+    // Exec events must still be delivered to agents without periodic heartbeats.
+    if (!isExecEventReason) {
+      return { status: "skipped", reason: "disabled" };
+    }
   }
   if (!resolveHeartbeatIntervalMs(cfg, undefined, heartbeat)) {
-    return { status: "skipped", reason: "disabled" };
+    if (!isExecEventReason) {
+      return { status: "skipped", reason: "disabled" };
+    }
   }
 
   const startedAt = opts.deps?.nowMs?.() ?? Date.now();
@@ -513,7 +527,6 @@ export async function runHeartbeatOnce(opts: {
   // Skip heartbeat if HEARTBEAT.md exists but has no actionable content.
   // This saves API calls/costs when the file is effectively empty (only comments/headers).
   // EXCEPTION: Don't skip for exec events - they have pending system events to process.
-  const isExecEventReason = opts.reason === "exec-event";
   const workspaceDir = resolveAgentWorkspaceDir(cfg, agentId);
   const heartbeatFilePath = path.join(workspaceDir, DEFAULT_HEARTBEAT_FILENAME);
   try {
@@ -565,8 +578,28 @@ export async function runHeartbeatOnce(opts: {
   // If so, use a specialized prompt that instructs the model to relay the result
   // instead of the standard heartbeat prompt with "reply HEARTBEAT_OK".
   const isExecEvent = opts.reason === "exec-event";
-  const pendingEvents = isExecEvent ? peekSystemEvents(sessionKey) : [];
-  const hasExecCompletion = pendingEvents.some((evt) => evt.includes("Exec finished"));
+  // Exec exit events are enqueued to the originating session key (e.g. a
+  // Discord channel session like "agent:main:discord:channel:123") which may
+  // differ from the heartbeat session key. Search all sessions for this agent.
+  const agentPrefix = `agent:${agentId}:`;
+  const pendingEvents = isExecEvent
+    ? peekSystemEventsForPrefix(agentPrefix)
+    : [];
+  const hasExecCompletion = pendingEvents.some(
+    (evt) => evt.includes("Exec completed") || evt.includes("Exec failed"),
+  );
+
+  // If exec events exist on non-heartbeat session keys, drain them and
+  // re-enqueue onto the heartbeat session so the standard drain logic in
+  // session-updates.ts picks them up during the agent run.
+  if (hasExecCompletion) {
+    const drained = drainSystemEventsForPrefix(agentPrefix);
+    for (const event of drained) {
+      if (event.text.includes("Exec completed") || event.text.includes("Exec failed")) {
+        enqueueSystemEvent(event.text, { sessionKey });
+      }
+    }
+  }
 
   const prompt = hasExecCompletion ? EXEC_EVENT_PROMPT : resolveHeartbeatPrompt(cfg, heartbeat);
   const ctx = {

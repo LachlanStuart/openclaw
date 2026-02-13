@@ -99,6 +99,43 @@ export function peekSystemEvents(sessionKey: string): string[] {
   return queues.get(key)?.queue.map((e) => e.text) ?? [];
 }
 
+/**
+ * Peek at system events across ALL session keys that start with a given prefix.
+ * Used by the heartbeat runner to find exec-event notifications enqueued to
+ * channel-specific sessions (e.g. "agent:main:discord:channel:123") when the
+ * heartbeat session key is "agent:main:main".
+ */
+export function peekSystemEventsForPrefix(prefix: string): string[] {
+  const results: string[] = [];
+  for (const [key, entry] of queues) {
+    if (key.startsWith(prefix)) {
+      for (const e of entry.queue) {
+        results.push(e.text);
+      }
+    }
+  }
+  return results;
+}
+
+/**
+ * Drain system events from ALL session keys matching a prefix, merging them
+ * into a single list sorted by timestamp. Used for exec-event delivery where
+ * events may be enqueued to a different session key than the heartbeat session.
+ */
+export function drainSystemEventsForPrefix(prefix: string): SystemEvent[] {
+  const results: SystemEvent[] = [];
+  for (const [key, entry] of queues) {
+    if (key.startsWith(prefix) && entry.queue.length > 0) {
+      results.push(...entry.queue);
+      entry.queue.length = 0;
+      entry.lastText = null;
+      entry.lastContextKey = null;
+      queues.delete(key);
+    }
+  }
+  return results.sort((a, b) => a.ts - b.ts);
+}
+
 export function hasSystemEvents(sessionKey: string) {
   const key = requireSessionKey(sessionKey);
   return (queues.get(key)?.queue.length ?? 0) > 0;
