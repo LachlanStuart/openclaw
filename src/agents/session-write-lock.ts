@@ -14,7 +14,7 @@ type HeldLock = {
 };
 
 const HELD_LOCKS = new Map<string, HeldLock>();
-const CLEANUP_SIGNALS = ["SIGINT", "SIGTERM", "SIGQUIT", "SIGABRT"] as const;
+const CLEANUP_SIGNALS = ["SIGINT", "SIGTERM", "SIGQUIT", "SIGABRT", "SIGUSR1"] as const;
 type CleanupSignal = (typeof CLEANUP_SIGNALS)[number];
 const cleanupHandlers = new Map<CleanupSignal, () => void>();
 
@@ -145,8 +145,11 @@ export async function acquireSessionWriteLock(params: {
           return;
         }
         HELD_LOCKS.delete(normalizedSessionFile);
-        await current.handle.close();
-        await fs.rm(current.lockPath, { force: true });
+        try {
+          await current.handle.close();
+        } finally {
+          await fs.rm(current.lockPath, { force: true });
+        }
       },
     };
   }
@@ -173,8 +176,11 @@ export async function acquireSessionWriteLock(params: {
             return;
           }
           HELD_LOCKS.delete(normalizedSessionFile);
-          await current.handle.close();
-          await fs.rm(current.lockPath, { force: true });
+          try {
+            await current.handle.close();
+          } finally {
+            await fs.rm(current.lockPath, { force: true });
+          }
         },
       };
     } catch (err) {
@@ -186,7 +192,12 @@ export async function acquireSessionWriteLock(params: {
       const createdAt = payload?.createdAt ? Date.parse(payload.createdAt) : NaN;
       const stale = !Number.isFinite(createdAt) || Date.now() - createdAt > staleMs;
       const alive = payload?.pid ? isAlive(payload.pid) : false;
-      if (stale || !alive) {
+      // In k8s/containers, PID is always 1 — isAlive(1) always returns true
+      // even after pod restarts (new process inherits PID 1). Detect orphaned
+      // self-locks: same PID as us but not tracked in HELD_LOCKS.
+      const orphanedSelfLock =
+        alive && payload?.pid === process.pid && !HELD_LOCKS.has(normalizedSessionFile);
+      if (stale || !alive || orphanedSelfLock) {
         await fs.rm(lockPath, { force: true });
         continue;
       }
